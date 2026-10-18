@@ -29,7 +29,9 @@ CLOSE_PAIRS = [("PC>2.5", "PC<2.5"), ("AvgC>2.5", "AvgC<2.5")]
 
 # ---------------------------------------------------------------- données
 def _read(url):
-    return pd.read_csv(url, encoding="latin-1", on_bad_lines="skip")
+   df = pd.read_csv(url , encoding="latin-1" , on_bad_lines="skip")
+   df . colums = [str(c).replace("ï»¿", "").replace("\ufeff","").strip() for c in df.colums]
+   return df 
 
 
 def season_codes(n, today=None):
