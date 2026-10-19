@@ -39,50 +39,116 @@ except Exception as e:
     st.error(f"Impossible de charger les données : {e}")
     st.stop()
 
-tab1, tab2, tab3 = st.tabs(["Prédictions", "Backtest", "À propos"])
+up = pd.DataFrame()
+try:
+    fx = fixtures(tuple(divs))
+    today = pd.Timestamp.today().normalize()
+    fx = fx[(fx.Date >= today) & (fx.Date <= today + pd.Timedelta(days=days))]
+    if not fx.empty:
+        with st.spinner("Calcul des probabilités…"):
+            up = M.predict_upcoming(hist, elo, fx, w_model, edge_min)
+except Exception as e:
+    st.error(f"Matchs à venir indisponibles : {e}")
+
+tab1, tab_j, tab2, tab3 = st.tabs(["Prédictions", "Journal", "Backtest", "À propos"])
 
 # ------------------------------------------------------------- prédictions
 with tab1:
-    try:
-        fx = fixtures(tuple(divs))
-        end = pd.Timestamp.today().normalize() + pd.Timedelta(days=days)
-        fx = fx[(fx.Date >= pd.Timestamp.today().normalize()) & (fx.Date <= end)]
-    except Exception as e:
-        fx = pd.DataFrame()
-        st.error(f"Matchs à venir indisponibles : {e}")
-    if fx.empty:
-        st.info("Aucun match à venir sur cette période pour ces championnats.")
+    if up.empty:
+        st.info("Aucun match à venir sur cette période pour ces championnats (ou pas assez de données).")
     else:
-        with st.spinner("Calcul des probabilités…"):
-            up = M.predict_upcoming(hist, elo, fx, w_model, edge_min)
-        if up.empty:
-            st.info("Pas assez de données pour ces championnats.")
+        def tag(r):
+            if r.stake_over > 0:
+                return f"✅ Over ({r.stake_over:.1f} %)"
+            if r.stake_under > 0:
+                return f"✅ Under ({r.stake_under:.1f} %)"
+            return ""
+        show = pd.DataFrame({
+            "Date": up.Date.dt.strftime("%d/%m"),
+            "Match": up.HomeTeam + " – " + up.AwayTeam,
+            "Value": up.apply(tag, axis=1),
+            "Over 2.5 %": (up.p_over * 100).round(1),
+            "Cote juste O": (1 / up.p_over).round(2),
+            "Under 2.5 %": (up.p_under * 100).round(1),
+            "Cote juste U": (1 / up.p_under).round(2),
+            "BTTS %": (up.p_btts * 100).round(1),
+            "Cote juste BTTS": (1 / up.p_btts).round(2),
+            "Cote O": up.b_over.round(2),
+            "Avantage O %": (up.edge_over * 100).round(1),
+            "Cote U": up.b_under.round(2),
+            "Avantage U %": (up.edge_under * 100).round(1),
+        })
+        st.dataframe(show, hide_index=True, width="stretch")
+        st.caption("Probabilités = mix modèle + marché (réglable). « Value » : avantage ≥ seuil, "
+                   "mise suggérée en % de la bankroll (quart de Kelly, plafonnée à 2 %). "
+                   "Cotes = moyenne du marché. Les probabilités BTTS viennent du modèle seul.")
+        with st.expander("➕ Enregistrer un pari dans mon journal"):
+            rows = list(up.itertuples())
+            labels = [f"{r.Date:%d/%m} – {r.HomeTeam} – {r.AwayTeam}" for r in rows]
+            i = st.selectbox("Match", range(len(rows)), format_func=lambda k: labels[k])
+            pari = st.radio("Pari", ["Over 2.5", "Under 2.5"], horizontal=True)
+            row = up.iloc[i]
+            dflt = row["b_over"] if pari == "Over 2.5" else row["b_under"]
+            cote = st.number_input("Cote réellement obtenue", 1.01, 20.0,
+                                   float(dflt) if pd.notna(dflt) else 1.90, 0.01)
+            mise = st.number_input("Mise (€)", 0.5, 10000.0, 10.0, 0.5)
+            book = st.text_input("Bookmaker (facultatif)")
+            if st.button("Ajouter au journal"):
+                jr = st.session_state.get("journal", M.empty_journal())
+                st.session_state["journal"] = M.add_bet(jr, row, pari, cote, mise, book)
+                st.success("Pari ajouté. Pensez à télécharger votre journal dans l’onglet Journal.")
+
+# ------------------------------------------------------------- journal
+with tab_j:
+    st.write("Le journal enregistre chaque pari réel et calcule votre **CLV** : votre cote comparée à la cote "
+             "juste de clôture de Pinnacle. C’est le test le plus fiable pour savoir si vous avez un avantage.")
+    st.warning("Le journal n’est conservé que pendant votre visite. **Téléchargez-le après chaque ajout** "
+               "et réimportez-le à la visite suivante.")
+    if "journal" not in st.session_state:
+        st.session_state["journal"] = M.empty_journal()
+    f = st.file_uploader("Importer mon journal (fichier CSV)", type="csv")
+    if f is not None and st.session_state.get("journal_sig") != (f.name, f.size):
+        try:
+            imp = pd.read_csv(f)
+            st.session_state["journal"] = imp.reindex(columns=M.JOURNAL_COLS)
+            st.session_state["journal_sig"] = (f.name, f.size)
+            st.success(f"{len(imp)} pari(s) importé(s).")
+        except Exception as e:
+            st.error(f"Fichier illisible : {e}")
+    j = st.session_state["journal"]
+    c1, c2 = st.columns(2)
+    if c1.button("Mettre à jour les résultats"):
+        j, n = M.update_journal(j, hist)
+        st.session_state["journal"] = j
+        st.success(f"{n} pari(s) terminé(s) mis à jour." if n else
+                   "Aucun nouveau résultat (les données du site arrivent environ 1 jour après le match).")
+    c2.download_button("Télécharger mon journal", j.to_csv(index=False).encode("utf-8"),
+                       "journal_paris.csv", "text/csv")
+    if j.empty:
+        st.info("Journal vide. Ajoutez un pari depuis l’onglet Prédictions.")
+    else:
+        st_ = M.journal_stats(j)
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Paris terminés", f"{st_['termines']} / {st_['paris']}")
+        k2.metric("Profit", f"{st_['profit']:+.2f} €")
+        k3.metric("ROI", "–" if pd.isna(st_["roi"]) else f"{st_['roi']:+.1f} %")
+        k4.metric("CLV moyen", "–" if pd.isna(st_["clv"]) else f"{st_['clv']:+.1f} %",
+                  None if pd.isna(st_["clv_ic"]) else f"± {st_['clv_ic']:.1f}", delta_color="off")
+        if st_["n_clv"] < 100:
+            st.info(f"Trop tôt pour conclure : {st_['n_clv']} paris avec CLV. Visez 100 au minimum, idéalement 300 ou plus.")
+        elif st_["clv"] - st_["clv_ic"] > 0:
+            st.success("CLV positif et statistiquement distinct de zéro : signe d’un vrai avantage face au marché.")
+        elif st_["clv"] > 0:
+            st.warning("CLV positif mais pas encore distinguable du hasard. Continuez à accumuler des paris.")
         else:
-            def tag(r):
-                if r.stake_over > 0:
-                    return f"✅ Over ({r.stake_over:.1f} %)"
-                if r.stake_under > 0:
-                    return f"✅ Under ({r.stake_under:.1f} %)"
-                return ""
-            show = pd.DataFrame({
-                "Date": up.Date.dt.strftime("%d/%m"),
-                "Match": up.HomeTeam + " – " + up.AwayTeam,
-                "Value": up.apply(tag, axis=1),
-                "Over 2.5 %": (up.p_over * 100).round(1),
-                "Cote juste O": (1 / up.p_over).round(2),
-                "Under 2.5 %": (up.p_under * 100).round(1),
-                "Cote juste U": (1 / up.p_under).round(2),
-                "BTTS %": (up.p_btts * 100).round(1),
-                "Cote juste BTTS": (1 / up.p_btts).round(2),
-                "Cote O": up.b_over.round(2),
-                "Avantage O %": (up.edge_over * 100).round(1),
-                "Cote U": up.b_under.round(2),
-                "Avantage U %": (up.edge_under * 100).round(1),
-            })
-            st.dataframe(show, hide_index=True, width="stretch")
-            st.caption("Probabilités = mix modèle + marché (réglable). « Value » : avantage ≥ seuil, "
-                       "mise suggérée en % de la bankroll (quart de Kelly, plafonnée à 2 %). "
-                       "Cotes = moyenne du marché. Les probabilités BTTS viennent du modèle seul.")
+            st.error("CLV négatif ou nul : pas d’avantage démontré. Ne misez pas davantage.")
+        ser = st_["serie"]
+        if len(ser) > 1:
+            st.line_chart(ser.assign(Profit_cumulé=ser["profit"].cumsum()).set_index("date_match")["Profit_cumulé"])
+        st.caption("Vous pouvez corriger la cote, la mise ou le bookmaker dans le tableau, ou supprimer une ligne.")
+        locked = [c for c in M.JOURNAL_COLS if c not in ("cote_prise", "mise", "bookmaker")]
+        st.session_state["journal"] = st.data_editor(j, num_rows="dynamic", hide_index=True,
+                                                     disabled=locked, key="journal_editor", width="stretch")
 
 # ------------------------------------------------------------- backtest
 with tab2:

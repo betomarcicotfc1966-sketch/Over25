@@ -29,9 +29,10 @@ CLOSE_PAIRS = [("PC>2.5", "PC<2.5"), ("AvgC>2.5", "AvgC<2.5")]
 
 # ---------------------------------------------------------------- données
 def _read(url):
-   df = pd.read_csv(url , encoding="latin-1" , on_bad_lines="skip")
-   df . columns = [str(c).replace("ï»¿", "").replace("\ufeff","").strip() for c in df.columns]
-   return df 
+    df = pd.read_csv(url, encoding="latin-1", on_bad_lines="skip")
+    # le fichier commence parfois par un caractère invisible (BOM) qui abîme le nom de la 1re colonne
+    df.columns = [str(c).replace("ï»¿", "").replace("\ufeff", "").strip() for c in df.columns]
+    return df
 
 
 def season_codes(n, today=None):
@@ -245,3 +246,74 @@ def predict_upcoming(hist, E, fx, w_model=0.5, edge_min=0.05):
         kelly = (e / (odds - 1) / 4).clip(0, 0.02) * 100   # quart de Kelly, plafonné à 2 % de la bankroll
         o[f"stake_{s}"] = np.where(e >= edge_min, kelly, 0.0)
     return o.sort_values(["Date", "p_over"], ascending=[True, False])
+
+
+# ---------------------------------------------------------------- journal de paris
+JOURNAL_COLS = ["id", "date_match", "div", "domicile", "exterieur", "pari", "cote_prise", "mise",
+                "bookmaker", "p_modele", "resultat", "buts", "cote_cloture_juste", "clv_pct", "profit"]
+
+
+def empty_journal():
+    return pd.DataFrame(columns=JOURNAL_COLS)
+
+
+def add_bet(journal, match, pari, cote, mise, bookmaker=""):
+    """match : une ligne du tableau renvoyé par predict_upcoming."""
+    p = match["p_over"] if pari == "Over 2.5" else match["p_under"]
+    nid = int(pd.to_numeric(journal["id"]).max()) + 1 if len(journal) else 1
+    new = pd.DataFrame([{
+        "id": nid, "date_match": match["Date"].strftime("%Y-%m-%d"), "div": match["Div"],
+        "domicile": match["HomeTeam"], "exterieur": match["AwayTeam"], "pari": pari,
+        "cote_prise": float(cote), "mise": float(mise), "bookmaker": bookmaker,
+        "p_modele": round(float(p), 4), "resultat": "En attente", "buts": np.nan,
+        "cote_cloture_juste": np.nan, "clv_pct": np.nan, "profit": np.nan}])
+    return new if journal.empty else pd.concat([journal, new], ignore_index=True)[JOURNAL_COLS]
+
+
+def update_journal(journal, hist):
+    """Récupère score, résultat, cote juste de clôture (Pinnacle) et CLV des paris terminés."""
+    j = journal.copy()
+    h = hist.copy()
+    h["_d"] = h.Date.dt.normalize()
+    done = 0
+    for i, r in j.iterrows():
+        if r["resultat"] != "En attente":
+            continue
+        d = pd.Timestamp(r["date_match"])
+        m = h[(h.Div == r["div"]) & (h.HomeTeam == r["domicile"]) & (h.AwayTeam == r["exterieur"])
+              & ((h["_d"] - d).abs() <= pd.Timedelta(days=1))]
+        if m.empty:
+            continue
+        m = m.iloc[0]
+        total = int(m.FTHG + m.FTAG)
+        over = r["pari"] == "Over 2.5"
+        win = total > 2 if over else total <= 2
+        cote, mise = float(r["cote_prise"]), float(r["mise"])
+        j.at[i, "resultat"] = "Gagné" if win else "Perdu"
+        j.at[i, "buts"] = total
+        j.at[i, "profit"] = round(mise * (cote - 1) if win else -mise, 2)
+        if pd.notna(m.c_over) and pd.notna(m.c_under):
+            pc = float(devig(m.c_over, m.c_under))
+            ps = pc if over else 1 - pc
+            j.at[i, "cote_cloture_juste"] = round(1 / ps, 3)
+            j.at[i, "clv_pct"] = round((cote * ps - 1) * 100, 2)
+        done += 1
+    return j, done
+
+
+def journal_stats(journal):
+    j = journal.copy()
+    for c in ["cote_prise", "mise", "profit", "clv_pct"]:
+        j[c] = pd.to_numeric(j[c], errors="coerce")
+    s = j[j["resultat"].isin(["Gagné", "Perdu"])]
+    c = s["clv_pct"].dropna()
+    staked = s["mise"].sum()
+    return {
+        "paris": len(j), "termines": len(s), "en_attente": int((j["resultat"] == "En attente").sum()),
+        "profit": float(s["profit"].sum()),
+        "roi": float(s["profit"].sum() / staked * 100) if staked > 0 else np.nan,
+        "reussite": float((s["resultat"] == "Gagné").mean() * 100) if len(s) else np.nan,
+        "n_clv": len(c), "clv": float(c.mean()) if len(c) else np.nan,
+        "clv_ic": float(1.96 * c.std(ddof=1) / np.sqrt(len(c))) if len(c) > 1 else np.nan,
+        "serie": s.assign(date_match=s["date_match"].astype(str)).sort_values("date_match"),
+    }
