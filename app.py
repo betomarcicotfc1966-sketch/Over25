@@ -13,7 +13,8 @@ with st.sidebar:
     divs = st.multiselect("Championnats", list(M.LEAGUES), default=["E0", "SP1", "I1", "D1", "F1"],
                           format_func=lambda d: M.LEAGUES[d])
     n_seasons = st.slider("Saisons de données", 3, 7, 5)
-    w_model = st.slider("Poids du modèle (le reste = marché)", 0.0, 1.0, 0.5, 0.05)
+    auto = st.checkbox("Calibrage et poids automatiques (recommandé)", True)
+    w_manual = st.slider("Poids du modèle (le reste = marché)", 0.0, 1.0, 0.5, 0.05, disabled=auto)
     edge_min = st.slider("Avantage minimum pour jouer", 0.0, 0.15, 0.05, 0.01, format="%.2f")
     days = st.slider("Matchs des X prochains jours", 1, 14, 3)
 
@@ -22,10 +23,30 @@ if not divs:
     st.stop()
 
 
+@st.cache_resource
+def _last_good():
+    return {}
+
+
+def safe(fn, key, *args):
+    """Exécute fn ; si le site est injoignable, renvoie la dernière lecture réussie (stale=True)."""
+    store = _last_good()
+    try:
+        res = fn(*args)
+        store[key] = res
+        return res, False
+    except Exception:
+        if key in store:
+            return store[key], True
+        raise
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner="Téléchargement des données…")
 def load(divs_t, n):
-    df = M.load_results(list(divs_t), n)
-    return M.add_elo(df)
+    failed = []
+    df = M.load_results(list(divs_t), n, failed=failed)
+    hist, elo = M.add_elo(df)
+    return hist, elo, failed
 
 
 @st.cache_data(ttl=3600, show_spinner="Matchs à venir…")
@@ -33,22 +54,47 @@ def fixtures(divs_t):
     return M.load_fixtures(list(divs_t))
 
 
+@st.cache_data(ttl=24 * 3600, show_spinner="Calibrage du modèle sur le passé (environ 1 minute, une fois par jour)…")
+def tune(divs_t, n):
+    hist_, _, _ = load(divs_t, n)
+    y0 = int(hist_.Season.max())
+    return M.auto_tune(M.backtest(hist_, f"{y0 - 1}-08-01"))
+
+
 try:
-    hist, elo = load(tuple(divs), n_seasons)
+    (hist, elo, failed), stale = safe(load, ("load", tuple(divs), n_seasons), tuple(divs), n_seasons)
 except Exception as e:
     st.error(f"Impossible de charger les données : {e}")
     st.stop()
+if stale:
+    st.warning("Le site de données est injoignable : la dernière version enregistrée est utilisée.")
+if failed:
+    st.caption(f"{len(failed)} fichier(s) de données indisponible(s) (par exemple : {', '.join(failed[:4])}).")
+
+tuned = None
+if auto:
+    try:
+        tuned = tune(tuple(divs), n_seasons)
+    except Exception:
+        st.warning("Calibrage automatique indisponible pour le moment : réglages par défaut utilisés.")
+cal = tuned["cal"] if tuned else M.IDENTITY
+w_model = tuned["w"] if tuned else w_manual
+st.sidebar.caption(f"Poids du modèle appliqué : {w_model:.0%} · Calibrage : "
+                   f"{'oui' if tuned and tuned['cal_applied'] else 'non'}")
 
 up = pd.DataFrame()
 try:
-    fx = fixtures(tuple(divs))
+    fx, fstale = safe(fixtures, ("fx", tuple(divs)), tuple(divs))
     today = pd.Timestamp.today().normalize()
     fx = fx[(fx.Date >= today) & (fx.Date <= today + pd.Timedelta(days=days))]
+    if fstale:
+        st.caption("Matchs à venir : dernière version enregistrée (site injoignable).")
     if not fx.empty:
         with st.spinner("Calcul des probabilités…"):
-            up = M.predict_upcoming(hist, elo, fx, w_model, edge_min)
-except Exception as e:
-    st.error(f"Matchs à venir indisponibles : {e}")
+            up = M.predict_upcoming(hist, elo, fx, w_model, edge_min, cal)
+except Exception:
+    st.warning("Les matchs à venir ne sont pas disponibles pour le moment (site de données injoignable). "
+               "Réessayez dans quelques minutes.")
 
 tab1, tab_j, tab2, tab3 = st.tabs(["Prédictions", "Journal", "Backtest", "À propos"])
 
@@ -57,31 +103,34 @@ with tab1:
     if up.empty:
         st.info("Aucun match à venir sur cette période pour ces championnats (ou pas assez de données).")
     else:
-        def tag(r):
-            if r.stake_over > 0:
-                return f"✅ Over ({r.stake_over:.1f} %)"
-            if r.stake_under > 0:
-                return f"✅ Under ({r.stake_under:.1f} %)"
-            return ""
-        show = pd.DataFrame({
-            "Date": up.Date.dt.strftime("%d/%m"),
-            "Match": up.HomeTeam + " – " + up.AwayTeam,
-            "Value": up.apply(tag, axis=1),
-            "Over 2.5 %": (up.p_over * 100).round(1),
-            "Cote juste O": (1 / up.p_over).round(2),
-            "Under 2.5 %": (up.p_under * 100).round(1),
-            "Cote juste U": (1 / up.p_under).round(2),
-            "BTTS %": (up.p_btts * 100).round(1),
-            "Cote juste BTTS": (1 / up.p_btts).round(2),
-            "Cote O": up.b_over.round(2),
-            "Avantage O %": (up.edge_over * 100).round(1),
-            "Cote U": up.b_under.round(2),
-            "Avantage U %": (up.edge_under * 100).round(1),
-        })
-        st.dataframe(show, hide_index=True, width="stretch")
-        st.caption("Probabilités = mix modèle + marché (réglable). « Value » : avantage ≥ seuil, "
-                   "mise suggérée en % de la bankroll (quart de Kelly, plafonnée à 2 %). "
-                   "Cotes = moyenne du marché. Les probabilités BTTS viennent du modèle seul.")
+        c1, c2 = st.columns(2)
+        only_value = c1.checkbox("Seulement les paris avec value", False)
+        with_btts = c2.checkbox("Afficher aussi BTTS (sans cote bookmaker)", False)
+        rows = []
+        for r in up.itertuples():
+            match = f"{r.Date:%d/%m} · {r.HomeTeam} – {r.AwayTeam}"
+            bets = [("Over 2.5", r.p_over, r.b_over, r.edge_over), ("Under 2.5", r.p_under, r.b_under, r.edge_under)]
+            if with_btts:
+                bets.append(("BTTS Oui", r.p_btts, np.nan, np.nan))
+            for name, p, odds, edge in bets:
+                has_value = pd.notna(edge) and edge > 0 and edge >= edge_min
+                if only_value and not has_value:
+                    continue
+                rows.append({"Match": match, "Type de pari": f"{name} · {p * 100:.0f} %",
+                             "Cote juste": 1 / p, "Cote bookmaker": odds,
+                             "Expected Value": f"{edge * 100:+.1f} %" if has_value else ""})
+        if not rows:
+            st.info("Aucun pari avec value pour le moment. C’est le cas le plus fréquent.")
+        else:
+            show = pd.DataFrame(rows)
+            styled = (show.style
+                      .format({"Cote juste": "{:.2f}", "Cote bookmaker": "{:.2f}"}, na_rep="–")
+                      .apply(lambda r: ["background-color: rgba(46,160,67,0.22)" if r["Expected Value"] else ""] * len(r),
+                             axis=1))
+            st.dataframe(styled, hide_index=True, width="stretch")
+        st.caption("Cote juste = 1 ÷ probabilité (mix modèle + marché, réglé automatiquement). "
+                   "Cote bookmaker = moyenne du marché. Expected Value = gain moyen attendu par euro misé, "
+                   "affiché seulement si l’avantage dépasse le seuil du menu de gauche (ligne en vert).")
         with st.expander("➕ Enregistrer un pari dans mon journal"):
             rows = list(up.itertuples())
             labels = [f"{r.Date:%d/%m} – {r.HomeTeam} – {r.AwayTeam}" for r in rows]
@@ -154,6 +203,16 @@ with tab_j:
 with tab2:
     st.write("Le backtest rejoue le passé : pour chaque mois, le modèle n’utilise que les matchs déjà joués, "
              "puis on compare ses prévisions aux résultats réels et aux cotes du marché.")
+    if tuned:
+        with st.expander("Réglages automatiques en vigueur", expanded=True):
+            st.write(f"**Poids du modèle retenu : {tuned['w']:.0%}** (le reste = marché).")
+            if tuned["cal_applied"]:
+                st.write(f"**Calibrage appliqué** : l’erreur passe de {tuned['brier_raw_holdout']:.4f} à "
+                         f"{tuned['brier_cal_holdout']:.4f} sur des matchs non utilisés pour le réglage.")
+            else:
+                st.write("**Calibrage non appliqué** : il n’améliore pas les matchs jamais vus.")
+            st.caption("Réglage fait sur la saison passée et la saison en cours. Le tableau ci-dessous est mesuré "
+                       "sur ces mêmes matchs : il est donc légèrement optimiste.")
     k = st.radio("Période testée", [1, 2, 3], index=1, horizontal=True,
                  format_func=lambda x: f"{x} dernière{'s' if x > 1 else ''} saison{'s' if x > 1 else ''}")
     if st.button("Lancer le backtest", type="primary"):
@@ -165,11 +224,11 @@ with tab2:
             st.error(str(e))
         bar.empty()
     if "bt" in st.session_state:
-        summary, calib, bets = M.evaluate(st.session_state["bt"], w_model)
+        summary, calib, bets = M.evaluate(st.session_state["bt"], w_model, cal=cal)
         st.subheader("Qui prédit le mieux ?")
         st.dataframe(summary, hide_index=True, width="stretch")
         m = summary.set_index("Prédicteur")["Score de Brier (plus bas = mieux)"]
-        mdl, mkt = m["Votre modèle seul"], m["Marché avant-match (sans marge)"]
+        mdl, mkt = m["Votre modèle recalibré"], m["Marché avant-match (sans marge)"]
         if mdl >= mkt:
             st.warning("Le modèle seul prédit moins bien que le marché : c’est le cas habituel. "
                        "Gardez un poids du marché élevé et ne misez pas sur le modèle seul.")
@@ -191,7 +250,7 @@ with tab3:
 
 **Modèle** : régression de Poisson régularisée (force d’attaque et de défense, avantage du terrain),
 matchs récents pondérés davantage, écart d’Élo calculé avant chaque match. Le total de buts suit une loi de Poisson.
-Les probabilités finales mélangent le modèle et le marché sans marge.
+La probabilité d’Over 2.5 est recalibrée automatiquement si cela améliore des matchs jamais vus, puis mélangée au marché sans marge avec un poids choisi par le backtest (le marché reste privilégié à égalité).
 
 **Limites** : pas de xG, pas de blessés ni de compositions. Un avantage durable face au marché est rare ;
 n’engagez que de l’argent que vous pouvez perdre.
