@@ -1,6 +1,0 @@
-streamlit>=1.50,<2
-pandas>=2.0,<4
-numpy>=1.26,<3
-scipy>=1.11,<2
-scikit-learn>=1.2,<2
-jinja2>=3.0
