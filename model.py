@@ -87,11 +87,30 @@ def load_results(divs, n_seasons=5, today=None, reader=_read, failed=None):
     return add_odds(df).sort_values("Date").reset_index(drop=True)
 
 
-def load_fixtures(divs, reader=_read):
-    fx = reader(f"{BASE}/fixtures.csv")
-    fx = fx[fx["Div"].isin(divs)].copy()
-    fx["Date"] = pd.to_datetime(fx["Date"], dayfirst=True, errors="coerce", format="mixed")
-    fx = fx.dropna(subset=["Date", "HomeTeam", "AwayTeam"])
+def _parse_dates(s):
+    """Dates jour/mois/année (4 ou 2 chiffres pour l'année), sans jamais inverser jour et mois."""
+    s = s.astype(str).str.strip()
+    d = pd.to_datetime(s, format="%d/%m/%Y", errors="coerce")
+    m = d.isna()
+    if m.any():
+        d[m] = pd.to_datetime(s[m], format="%d/%m/%y", errors="coerce")
+    m = d.isna()
+    if m.any():
+        d[m] = pd.to_datetime(s[m], dayfirst=True, errors="coerce", format="mixed")
+    return d
+
+
+def load_fixtures(divs, reader=_read, report=None):
+    """Matchs à venir du site. 'report' (dict, facultatif) reçoit des informations de diagnostic."""
+    raw = reader(f"{BASE}/fixtures.csv")
+    raw["Div"] = raw["Div"].astype(str).str.strip()
+    raw["Date"] = _parse_dates(raw["Date"])
+    if report is not None:
+        ok = raw.dropna(subset=["Date"])
+        report.update(rows=len(raw), divs=raw["Div"].value_counts().to_dict(),
+                      dmin=ok["Date"].min() if len(ok) else None,
+                      dmax=ok["Date"].max() if len(ok) else None)
+    fx = raw[raw["Div"].isin(divs)].dropna(subset=["Date", "HomeTeam", "AwayTeam"]).copy()
     return add_odds(fx)
 
 

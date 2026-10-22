@@ -51,7 +51,9 @@ def load(divs_t, n):
 
 @st.cache_data(ttl=3600, show_spinner="Matchs à venir…")
 def fixtures(divs_t):
-    return M.load_fixtures(list(divs_t))
+    report = {}
+    fx_ = M.load_fixtures(list(divs_t), report=report)
+    return fx_, report
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner="Calibrage du modèle sur le passé (environ 1 minute, une fois par jour)…")
@@ -83,25 +85,50 @@ st.sidebar.caption(f"Poids du modèle appliqué : {w_model:.0%} · Calibrage : "
                    f"{'oui' if tuned and tuned['cal_applied'] else 'non'}")
 
 up = pd.DataFrame()
+diag = {}
 try:
-    fx, fstale = safe(fixtures, ("fx", tuple(divs)), tuple(divs))
+    (fx_all, rep), fstale = safe(fixtures, ("fx", tuple(divs)), tuple(divs))
     today = pd.Timestamp.today().normalize()
-    fx = fx[(fx.Date >= today) & (fx.Date <= today + pd.Timedelta(days=days))]
+    fx = fx_all[(fx_all.Date >= today) & (fx_all.Date <= today + pd.Timedelta(days=days))]
+    diag = {"rep": rep, "fx_all": fx_all, "n_window": len(fx), "today": today}
     if fstale:
         st.caption("Matchs à venir : dernière version enregistrée (site injoignable).")
     if not fx.empty:
         with st.spinner("Calcul des probabilités…"):
             up = M.predict_upcoming(hist, elo, fx, w_model, edge_min, cal)
-except Exception:
-    st.warning("Les matchs à venir ne sont pas disponibles pour le moment (site de données injoignable). "
-               "Réessayez dans quelques minutes.")
+except Exception as e:
+    st.warning("Les matchs à venir ne sont pas disponibles pour le moment. Réessayez dans quelques minutes.")
+    st.caption(f"Détail technique : {e}")
 
 tab1, tab_j, tab2, tab3 = st.tabs(["Prédictions", "Journal", "Backtest", "À propos"])
 
 # ------------------------------------------------------------- prédictions
 with tab1:
     if up.empty:
-        st.info("Aucun match à venir sur cette période pour ces championnats (ou pas assez de données).")
+        st.info("Aucun match à venir sur cette période pour ces championnats.")
+        if diag:
+            with st.expander("Diagnostic : pourquoi aucun match ?", expanded=True):
+                rep, fx_all, today = diag["rep"], diag["fx_all"], diag["today"]
+                if rep:
+                    d1 = rep["dmin"].strftime("%d/%m/%Y") if rep.get("dmin") is not None and pd.notna(rep.get("dmin")) else "?"
+                    d2 = rep["dmax"].strftime("%d/%m/%Y") if rep.get("dmax") is not None and pd.notna(rep.get("dmax")) else "?"
+                    st.write(f"Fichier du site : **{rep['rows']} matchs**, du {d1} au {d2}.")
+                    st.write("Championnats présents : " + (", ".join(f"{M.LEAGUES.get(k, k)} ({v})" for k, v in rep["divs"].items()) or "aucun"))
+                st.write(f"Matchs de vos championnats dans ce fichier : **{len(fx_all)}** ; dans les {days} prochains jours : **{diag['n_window']}**.")
+                if rep and rep["rows"] == 0:
+                    st.error("Cause : le fichier du site est vide. Le calendrier n’est pas publié pour le moment.")
+                elif rep and rep.get("dmax") is not None and pd.notna(rep["dmax"]) and rep["dmax"] < today:
+                    st.error("Cause : le fichier du site est périmé (tous ses matchs sont déjà passés). Il sera mis à jour par le site.")
+                elif len(fx_all) == 0:
+                    st.error("Cause : aucun de vos championnats ne figure dans le fichier. Le site ne couvre pas tous les championnats à venir.")
+                elif diag["n_window"] == 0:
+                    nxt = fx_all[fx_all.Date >= today].Date.min()
+                    st.warning("Cause : le site ne publie que les prochaines journées. " +
+                               (f"Prochain match connu : {nxt:%d/%m/%Y}." if pd.notna(nxt) else "Aucun match futur dans le fichier."))
+                else:
+                    thin = [M.LEAGUES.get(d, d) for d in fx_all.Div.unique() if (hist.Div == d).sum() < 150]
+                    st.warning("Cause probable : historique insuffisant pour " + (", ".join(thin) if thin else "certains championnats")
+                               + ". Augmentez « Saisons de données » dans le menu de gauche.")
     else:
         c1, c2 = st.columns(2)
         only_value = c1.checkbox("Seulement les paris avec value", False)
