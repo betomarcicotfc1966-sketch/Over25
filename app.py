@@ -56,8 +56,11 @@ def fixtures(divs_t):
     return fx_, report
 
 
+CACHE_V = 3  # à augmenter si le calcul du calibrage change : force un nouveau calcul au lieu de réutiliser l'ancien
+
+
 @st.cache_data(ttl=24 * 3600, show_spinner="Calibrage du modèle sur le passé (environ 1 minute, une fois par jour)…")
-def tune(divs_t, n):
+def tune(divs_t, n, v=CACHE_V):
     hist_, _, _ = load(divs_t, n)
     y0 = int(hist_.Season.max())
     return M.auto_tune(M.backtest(hist_, f"{y0 - 1}-08-01"))
@@ -77,6 +80,9 @@ tuned = None
 if auto:
     try:
         tuned = tune(tuple(divs), n_seasons)
+        if "btts" not in tuned:  # résultat d'une ancienne version resté en mémoire : on recalcule
+            tune.clear()
+            tuned = tune(tuple(divs), n_seasons)
     except Exception:
         st.warning("Calibrage automatique indisponible pour le moment : réglages par défaut utilisés.")
 cal = tuned["cal"] if tuned else M.IDENTITY
