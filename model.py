@@ -197,13 +197,9 @@ def fit_calibration(p, y):
     return float(lr.intercept_[0]), float(lr.coef_[0][0])
 
 
-def auto_tune(bt):
-    """À partir du backtest : (1) calibre le modèle seulement si cela améliore des matchs jamais vus,
-    (2) choisit le poids du modèle qui minimise l'erreur, en préférant le marché à égalité."""
-    d = bt.dropna(subset=["p_over25"]).sort_values("Date").copy()
-    y = ((d.FTHG + d.FTAG) > 2).astype(int).values
-    p = d.p_over25.values
-    n = len(d)
+def _calib_report(p, y):
+    """Calibre sur les 60 % les plus anciens, vérifie sur les 40 % les plus récents (jamais vus)."""
+    n = len(p)
     cut = int(n * 0.6)
     cal, applied, b_raw, b_cal = IDENTITY, False, np.nan, np.nan
     try:
@@ -214,6 +210,20 @@ def auto_tune(bt):
             cal, applied = fit_calibration(p, y), True
     except Exception:
         pass
+    b_base = _brier(y[cut:], np.full(n - cut, y[:cut].mean()))   # « toujours la moyenne »
+    return {"cal": cal, "applied": applied, "b_raw": b_raw, "b_cal": b_cal, "b_base": b_base}
+
+
+def auto_tune(bt):
+    """À partir du backtest : calibre Over 2.5 et BTTS seulement si cela améliore des matchs jamais vus,
+    puis choisit le poids du modèle qui minimise l'erreur (le marché est préféré à égalité)."""
+    d = bt.dropna(subset=["p_over25"]).sort_values("Date").copy()
+    y = ((d.FTHG + d.FTAG) > 2).astype(int).values
+    yb = ((d.FTHG > 0) & (d.FTAG > 0)).astype(int).values
+    p = d.p_over25.values
+    n = len(d)
+    r = _calib_report(p, y)
+    cal = r["cal"]
     pc = apply_calibration(p, cal)
     mk = devig(d.o_over, d.o_under).values
     ok = ~np.isnan(mk)
@@ -224,8 +234,10 @@ def auto_tune(bt):
         table = pd.DataFrame({"poids": grid, "brier": scores})
     else:
         w_best, table = 0.5, pd.DataFrame({"poids": grid, "brier": np.nan})
-    return {"cal": cal, "cal_applied": applied, "brier_raw_holdout": b_raw, "brier_cal_holdout": b_cal,
-            "w": w_best, "table": table, "n": n, "n_mkt": int(ok.sum())}
+    rb = _calib_report(d.p_btts.values, yb)
+    return {"cal": cal, "cal_applied": r["applied"], "brier_raw_holdout": r["b_raw"],
+            "brier_cal_holdout": r["b_cal"], "w": w_best, "table": table, "n": n, "n_mkt": int(ok.sum()),
+            "cal_btts": rb["cal"], "btts": rb}
 
 
 # ---------------------------------------------------------------- backtest
@@ -295,8 +307,44 @@ def evaluate(bt, w_model=0.5, thresholds=(0.0, 0.03, 0.05, 0.08), cal=IDENTITY):
     return summary, calib, pd.DataFrame(rows)
 
 
+def by_league(bt, w_model=0.5, cal=IDENTITY, cal_btts=IDENTITY, edge_min=0.05):
+    """Détail par championnat. Les écarts sont comparés à leur marge d'erreur (2 écarts-types) :
+    en dessous, la différence est indiscernable du hasard."""
+    d = bt.copy()
+    d["y"] = ((d.FTHG + d.FTAG) > 2).astype(int)
+    d["yb"] = ((d.FTHG > 0) & (d.FTAG > 0)).astype(int)
+    d["pm"] = apply_calibration(d.p_over25, cal)
+    d["pb"] = apply_calibration(d.p_btts, cal_btts)
+    d["mk"] = devig(d.o_over, d.o_under)
+    d["p_cl"] = devig(d.c_over, d.c_under)
+    d["pf"] = np.where(d.mk.notna(), w_model * d.pm + (1 - w_model) * d.mk, d.pm)
+
+    def verdict(diff, better, worse):
+        diff = diff.dropna()
+        if len(diff) < 100:
+            return np.nan, "échantillon trop petit"
+        m, se = diff.mean(), diff.std(ddof=1) / np.sqrt(len(diff))
+        return m, (better if m < -2 * se else worse if m > 2 * se else "indiscernable")
+
+    rows = []
+    for div, g in d.groupby("Div"):
+        m1, v1 = verdict((g.pm - g.y) ** 2 - (g.mk - g.y) ** 2, "modèle meilleur", "marché meilleur")
+        base = g.yb.mean()
+        m2, v2 = verdict((g.pb - g.yb) ** 2 - (base - g.yb) ** 2, "meilleur que la moyenne", "moins bon que la moyenne")
+        bets = pd.concat([pd.DataFrame({"p": g.pf, "odds": g.b_over, "win": g.y == 1, "cl": g.p_cl}),
+                          pd.DataFrame({"p": 1 - g.pf, "odds": g.b_under, "win": g.y == 0, "cl": 1 - g.p_cl})])
+        bets = bets.dropna(subset=["odds", "p"])
+        bets = bets[bets.p * bets.odds - 1 >= edge_min]
+        clv = (bets.odds * bets.cl - 1).dropna()
+        rows.append({"Championnat": LEAGUES.get(div, div), "Matchs": len(g),
+                     "O/U 2.5 : écart vs marché": round(m1, 4), "Verdict O/U": v1,
+                     "BTTS : écart vs moyenne": round(m2, 4), "Verdict BTTS": v2,
+                     "Paris value": len(bets), "CLV %": round(100 * clv.mean(), 1) if len(clv) else np.nan})
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------- matchs à venir
-def predict_upcoming(hist, E, fx, w_model=0.5, edge_min=0.05, cal=IDENTITY):
+def predict_upcoming(hist, E, fx, w_model=0.5, edge_min=0.05, cal=IDENTITY, cal_btts=IDENTITY):
     res = []
     for d, g in fx.groupby("Div"):
         train = hist[hist.Div == d]
@@ -312,6 +360,7 @@ def predict_upcoming(hist, E, fx, w_model=0.5, edge_min=0.05, cal=IDENTITY):
         return pd.DataFrame()
     o = pd.concat(res)
     o["p_over25"] = apply_calibration(o.p_over25, cal)
+    o["p_btts"] = apply_calibration(o.p_btts, cal_btts)
     o["p_under25"] = 1 - o.p_over25
     o["p_mkt"] = devig(o.o_over, o.o_under)
     o["p_over"] = np.where(o.p_mkt.notna(), w_model * o.p_over25 + (1 - w_model) * o.p_mkt, o.p_over25)

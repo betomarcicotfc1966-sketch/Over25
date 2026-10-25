@@ -81,6 +81,7 @@ if auto:
         st.warning("Calibrage automatique indisponible pour le moment : réglages par défaut utilisés.")
 cal = tuned["cal"] if tuned else M.IDENTITY
 w_model = tuned["w"] if tuned else w_manual
+cal_btts = tuned["cal_btts"] if tuned else M.IDENTITY
 st.sidebar.caption(f"Poids du modèle appliqué : {w_model:.0%} · Calibrage : "
                    f"{'oui' if tuned and tuned['cal_applied'] else 'non'}")
 
@@ -95,7 +96,7 @@ try:
         st.caption("Matchs à venir : dernière version enregistrée (site injoignable).")
     if not fx.empty:
         with st.spinner("Calcul des probabilités…"):
-            up = M.predict_upcoming(hist, elo, fx, w_model, edge_min, cal)
+            up = M.predict_upcoming(hist, elo, fx, w_model, edge_min, cal, cal_btts)
 except Exception as e:
     st.warning("Les matchs à venir ne sont pas disponibles pour le moment. Réessayez dans quelques minutes.")
     st.caption(f"Détail technique : {e}")
@@ -133,12 +134,24 @@ with tab1:
         c1, c2 = st.columns(2)
         only_value = c1.checkbox("Seulement les paris avec value", False)
         with_btts = c2.checkbox("Afficher aussi BTTS (sans cote bookmaker)", False)
+        if with_btts and tuned:
+            rb = tuned["btts"]
+            fin = rb["b_cal"] if rb["applied"] else rb["b_raw"]
+            skill = rb["b_base"] - fin
+            if skill <= 0:
+                st.error("BTTS : sur des matchs jamais vus, le modèle ne fait pas mieux que la simple moyenne. "
+                         "Ne vous fiez pas à ces probabilités.")
+            elif skill < 0.002:
+                st.warning("BTTS : signal très faible sur des matchs jamais vus. À utiliser avec prudence.")
+            else:
+                st.info("BTTS : le modèle fait mieux que la moyenne, mais aucune cote BTTS n’est disponible "
+                        "dans les données : impossible de mesurer une value.")
         rows = []
         for r in up.itertuples():
             match = f"{r.Date:%d/%m} · {r.HomeTeam} – {r.AwayTeam}"
             bets = [("Over 2.5", r.p_over, r.b_over, r.edge_over), ("Under 2.5", r.p_under, r.b_under, r.edge_under)]
             if with_btts:
-                bets.append(("BTTS Oui", r.p_btts, np.nan, np.nan))
+                bets += [("BTTS Oui", r.p_btts, np.nan, np.nan), ("BTTS Non", 1 - r.p_btts, np.nan, np.nan)]
             for name, p, odds, edge in bets:
                 has_value = pd.notna(edge) and edge > 0 and edge >= edge_min
                 if only_value and not has_value:
@@ -240,6 +253,20 @@ with tab2:
                 st.write("**Calibrage non appliqué** : il n’améliore pas les matchs jamais vus.")
             st.caption("Réglage fait sur la saison passée et la saison en cours. Le tableau ci-dessous est mesuré "
                        "sur ces mêmes matchs : il est donc légèrement optimiste.")
+    if tuned:
+        rb = tuned["btts"]
+        with st.expander("BTTS : fiabilité mesurée", expanded=True):
+            fin = rb["b_cal"] if rb["applied"] else rb["b_raw"]
+            st.write(f"Erreur (Brier) sur des matchs non utilisés pour le réglage : modèle **{fin:.4f}** contre "
+                     f"**{rb['b_base']:.4f}** pour « toujours la moyenne » "
+                     f"({'calibrage appliqué' if rb['applied'] else 'sans calibrage'}).")
+            if rb["b_base"] - fin <= 0:
+                st.error("Le modèle ne fait pas mieux que la moyenne sur le BTTS : ne vous fiez pas à ses probabilités.")
+            elif rb["b_base"] - fin < 0.002:
+                st.warning("Signal très faible : à utiliser avec prudence.")
+            else:
+                st.success("Le modèle fait mieux que la moyenne. Les données ne contiennent pas de cotes BTTS : "
+                           "on ne peut pas savoir s’il bat le marché.")
     k = st.radio("Période testée", [1, 2, 3], index=1, horizontal=True,
                  format_func=lambda x: f"{x} dernière{'s' if x > 1 else ''} saison{'s' if x > 1 else ''}")
     if st.button("Lancer le backtest", type="primary"):
@@ -265,6 +292,11 @@ with tab2:
         st.dataframe(calib, hide_index=True, width="stretch")
         st.subheader("Simulation de paris (mise fixe, cotes moyennes)")
         st.dataframe(bets, hide_index=True, width="stretch")
+        st.subheader("Par championnat")
+        st.dataframe(M.by_league(st.session_state["bt"], w_model, cal, cal_btts, edge_min),
+                     hide_index=True, width="stretch")
+        st.caption("Écart négatif = le modèle fait mieux. Un écart n’est retenu que s’il dépasse sa marge d’erreur "
+                   "(2 écarts-types), sinon « indiscernable ». Avec peu de paris value, le CLV par championnat reste très bruité.")
         st.caption("CLV = votre cote comparée à la cote juste de clôture. C’est le meilleur indicateur d’un vrai "
                    "avantage : un CLV positif et stable sur plusieurs centaines de paris compte plus qu’un ROI "
                    "flatteur obtenu par chance.")
